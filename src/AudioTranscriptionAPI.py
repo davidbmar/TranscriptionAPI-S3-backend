@@ -1,5 +1,5 @@
-#!/usr/bin/python3
 import os
+#!/usr/bin/python3
 import uuid
 import json
 from functools import wraps
@@ -15,11 +15,23 @@ app = Flask(__name__)
 
 # --- Configuration ---
 # Fetch S3 bucket name from environment variable or use a default
-S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "your-audio-bucket-name")
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "2025-04-18-audio-transcription-api-s3-backend-us-east-2")
 # Fetch AWS region from environment variable or use a default
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-2")
 # Presigned URL expiration time in seconds (e.g., 15 minutes)
 PRESIGNED_URL_EXPIRATION = int(os.environ.get("PRESIGNED_URL_EXPIRATION", 900))
+
+# --- Determine the correct S3 endpoint URL based on the region ---
+# Standard regional endpoint format
+s3_endpoint_url = f'https://s3.{AWS_REGION}.amazonaws.com'
+# Handle potential edge case for us-east-1 which sometimes doesn't need the region in the URL
+# Although for consistency, including it is generally fine. Boto3 might handle this,
+# but being explicit might help here. If us-east-1 was the region, you might use:
+# s3_endpoint_url = 'https://s3.amazonaws.com' if AWS_REGION == 'us-east-1' else f'https://s3.{AWS_REGION}.amazonaws.com'
+
+print ("this is the bucket :"+S3_BUCKET_NAME)
+print ("this is the region :"+AWS_REGION)
+print ("this is the endpoint URL:"+s3_endpoint_url) # Added print for endpoint
 
 # --- Mock API Key Storage (Replace with a secure database/secrets manager) ---
 # In a real application, fetch these securely, e.g., from AWS Secrets Manager or a database.
@@ -28,12 +40,16 @@ API_KEYS = {
     os.environ.get("USER1_API_KEY", "test_key_user1_abc"): "user1",
     os.environ.get("USER2_API_KEY", "test_key_user2_def"): "user2",
     # Add more keys as needed
+    # Make sure the key you use in testing actually exists here or in env vars
+    os.environ.get("SECURE_USER1_KEY", "your_secure_api_key_for_user1"): "user1",
 }
 
 # --- AWS S3 Client ---
+# Explicitly provide the endpoint_url based on the region
 s3_client = boto3.client(
     's3',
     region_name=AWS_REGION,
+    endpoint_url=s3_endpoint_url, # *** ADDED THIS LINE ***
     # Credentials will be automatically picked up from standard locations:
     # 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
     # 2. Shared credential file (~/.aws/credentials)
@@ -55,12 +71,9 @@ def require_api_key(f):
         username = API_KEYS.get(token)
 
         if not username:
+            # Add extra logging to see which key failed
+            print(f"Failed auth attempt with token: {token[:5]}...") # Log prefix only
             abort(401, description="Invalid API Key.")
-
-        # Inject username into the request context or pass as argument if needed
-        # For simplicity here, we'll rely on functions getting username where needed.
-        # You could use Flask's 'g' object: g.username = username
-        # Or modify function signatures: f(username=username, *args, **kwargs)
 
         # Store username for potential use in the route function
         request.authenticated_username = username
@@ -93,6 +106,7 @@ def generate_presigned_url():
     s3_object_key = f"uploads/{username}/{transcription_id}/audio.mp3"
 
     try:
+        print(f"Generating URL for Bucket: {S3_BUCKET_NAME}, Key: {s3_object_key}, Region: {AWS_REGION}, Endpoint: {s3_endpoint_url}")
         presigned_url = s3_client.generate_presigned_url(
             'put_object',
             Params={
@@ -104,12 +118,15 @@ def generate_presigned_url():
             ExpiresIn=PRESIGNED_URL_EXPIRATION,
             HttpMethod='PUT'
         )
+        print(f"Generated URL: {presigned_url}") # Log the generated URL
         return jsonify({
             "presigned_url": presigned_url,
             "transcription_id": transcription_id
         }), 200
     except ClientError as e:
         print(f"Error generating presigned URL: {e}")
+        # Log more details if possible
+        print(f"Boto3 client config: region={s3_client.meta.region_name}, endpoint={s3_client.meta.endpoint_url}")
         abort(500, description="Could not generate presigned URL.")
     except Exception as e:
         print(f"Unexpected error: {e}")
@@ -137,6 +154,7 @@ def validate_upload():
 
     try:
         # head_object is efficient for checking existence and getting metadata
+        print(f"Validating upload for Bucket: {S3_BUCKET_NAME}, Key: {s3_object_key}")
         response = s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=s3_object_key)
         file_size_bytes = response.get('ContentLength', 0)
         # Simple conversion to MB for display
@@ -152,6 +170,7 @@ def validate_upload():
     except ClientError as e:
         if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
              # Standard way S3 indicates object not found
+            print(f"Validation: Object not found - {s3_object_key}")
             return jsonify({
                 "transcription_id": transcription_id,
                 "status": "not_found",
@@ -183,6 +202,7 @@ def get_transcription(transcription_id):
     s3_object_key = f"transcriptions/{username}/{transcription_id}/transcript.json"
 
     try:
+        print(f"Getting transcription for Bucket: {S3_BUCKET_NAME}, Key: {s3_object_key}")
         response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_object_key)
         # Read the content of the file
         transcription_content = response['Body'].read().decode('utf-8')
@@ -195,6 +215,7 @@ def get_transcription(transcription_id):
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             # If the transcript file doesn't exist yet
+            print(f"Transcription not found: {s3_object_key}")
             return jsonify({
                 "transcription_id": transcription_id,
                 "status": "processing or not found",
@@ -248,46 +269,6 @@ def internal_server_error(error):
 if __name__ == '__main__':
     # Set debug=True for development, but turn off for production
     # Use host='0.0.0.0' to make it accessible on your network (e.g., from EC2)
+    # Consider removing debug=True when running behind Apache/Gunicorn
     app.run(host='0.0.0.0', port=5000, debug=True)
-```text Requirements File (requirements.txt)
-Flask>=2.0
-boto3>=1.20
-python-dotenv>=0.19
-```text Environment File (.env - Example)
-# Replace with your actual bucket name
-S3_BUCKET_NAME=your-unique-audio-bucket-name
-AWS_REGION=us-east-1 # Or your preferred AWS region
 
-# Example API Keys (Store these securely in production!)
-USER1_API_KEY=test_key_user1_abc
-USER2_API_KEY=test_key_user2_def
-
-# Optional: Presigned URL expiration (default is 900 seconds / 15 minutes)
-# PRESIGNED_URL_EXPIRATION=600
-
-# AWS Credentials should ideally be handled via IAM roles (EC2/Lambda)
-# or environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-# Do NOT hardcode credentials here.
-```
-
-**Explanation & Next Steps:**
-
-1.  **Dependencies:** Make sure you have Python installed, then install the required libraries: `pip install Flask boto3 python-dotenv`.
-2.  **Configuration:**
-    * Create a `.env` file in the same directory as the Python script and add your `S3_BUCKET_NAME`, `AWS_REGION`, and API keys (as shown in the example `.env` content). **Crucially, replace the example API keys with your own secure keys.** For production, manage secrets using AWS Secrets Manager or environment variables set by your deployment process, not a `.env` file.
-    * Ensure the AWS credentials for `boto3` are configured correctly (e.g., via environment variables `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, or an IAM role if running on EC2/Lambda). The IAM user/role needs permissions for `s3:PutObject` (for the presigned URL), `s3:HeadObject` (for validation), and `s3:GetObject` (for retrieving transcripts) on the specified bucket and paths.
-3.  **S3 Bucket:** Create the S3 bucket specified in your `.env` file (or update the code/`.env` file if it already exists).
-4.  **Running Locally:** Execute the script using `python your_script_name.py`. The API will be available at `http://localhost:5000`.
-5.  **Running on EC2:**
-    * Copy the script, `requirements.txt`, and potentially the `.env` file (though managing environment variables directly on EC2 is better) to your instance.
-    * Install dependencies: `pip install -r requirements.txt`.
-    * Configure an IAM role for the EC2 instance with the necessary S3 permissions. This is more secure than storing credentials on the instance.
-    * Run the application using a production-ready WSGI server like Gunicorn: `gunicorn --bind 0.0.0.0:80 app:app` (replace `app` with your script name if different, assuming the Flask instance is named `app`). You might run this behind a web server like Nginx.
-6.  **Testing:**
-    * **Presigned URL:** `curl -X POST http://<your-host>:5000/v1/uploads/presigned-url -H "Authorization: Bearer <your_api_key>"`
-    * **Upload:** Use the returned `presigned_url` with `curl`: `curl -X PUT --upload-file /path/to/your/audio.mp3 "<presigned_url>"`
-    * **Validate:** `curl http://<your-host>:5000/v1/uploads/validate?username=<username>&transcription_id=<transcription_id> -H "Authorization: Bearer <your_api_key>"`
-    * **Get Transcript:** `curl http://<your-host>:5000/v1/transcriptions/<transcription_id> -H "Authorization: Bearer <your_api_key>"` (This will return 404 until you manually place a `transcript.json` file in the corresponding S3 location, e.g., `s3://your-bucket/transcriptions/user1/the-transcription-id/transcript.json`).
-7.  **Lambda Transition:** To run this on AWS Lambda, you would typically use a framework like AWS Chalice or Zappa, or manually configure API Gateway to trigger a Lambda function. These frameworks help package your Flask app and its dependencies for the Lambda environment. The core logic within the route functions would remain similar, but the application setup and deployment process would change significantly.
-
-This code provides the foundation specified in your design document. Let me know if you have questions or want to elaborate on specific par
